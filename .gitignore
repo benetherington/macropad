@@ -1,0 +1,5 @@
+adafruit-circuitpython-bundle-7.x-mpy-20210806/**
+lib/**
+**.uf2
+**workspace
+/run_on_save.py
