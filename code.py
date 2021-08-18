@@ -1,16 +1,15 @@
 #autocopy
 
 from adafruit_fancyled.adafruit_fancyled    import expand_gradient, CRGB, denormalize
+from adafruit_hid.keyboard                  import Keyboard
+from adafruit_hid.keycode                   import Keycode as K
 import board
 from digitalio                              import DigitalInOut, Pull
 import keypad
 import neopixel
 import rotaryio
-from time                                   import sleep, monotonic
+from time                                   import monotonic
 import usb_hid
-from adafruit_hid.keyboard                  import Keyboard
-from adafruit_hid.keycode                   import Keycode as K
-from ulab.numpy import roll, array, int8
 
 
 """ KEYPAD """
@@ -71,6 +70,10 @@ class Voicemeeter():
         self.muted = not self.muted
 
 class MacroKeys():
+    """
+    The heavy lifter. It takes input (via key presses and Voicemeeter.muted
+    state) and turns it into HID commands and neopixel colors.
+    """
     # configure how often to update pixel colors
     FRAME_LENGTH = 0.1
     # Configure state and ripple colors: a longer gradient will result in a
