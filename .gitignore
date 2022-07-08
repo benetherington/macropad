@@ -3,3 +3,4 @@ lib/**
 **.uf2
 **workspace
 /run_on_save.py
+.venv/**

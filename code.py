@@ -1,19 +1,29 @@
 #autocopy
 
+# Run synchronous or asynchronous
+USE_ASYNC = True
+# Disable all HID outputs
+REPL_MODE = True
+
+if USE_ASYNC:
+    import asyncio
+
+import board
+from digitalio                              import DigitalInOut, Pull
 from adafruit_display_text                  import label
 import adafruit_ds3231
 from adafruit_fancyled.adafruit_fancyled    import expand_gradient, CRGB, denormalize
 from adafruit_hid.keyboard                  import Keyboard
 from adafruit_hid.keycode                   import Keycode as K
-import board
-from digitalio                              import DigitalInOut, Pull
 import keypad
+from math                                   import copysign
 import neopixel
 import rotaryio
 from terminalio                             import FONT
-from time                                   import monotonic, struct_time
+from time                                   import monotonic
 import usb_hid
-from math import copysign
+
+
 
 
 """ CLOCK """
@@ -36,9 +46,23 @@ class Clock():
 
     def tick(self):
         if self.last_update+self.INTERVAL < monotonic():
-            t = rtc.datetime
-            hour = (t.tm_hour+1)%24
-            self.l.text = f"{hour:0>2}\n{t.tm_min:0>2}"
+            self._update_display()
+    async def tick_async(self):
+        while True:
+            # Do first update right away
+            self._update_display()
+            
+            # Do subsequent updates at the top of the minute
+            next_minute_seconds = 60 - rtc.datetime.tm_sec
+            print(f"next_minute_seconds: {next_minute_seconds}")
+            await asyncio.sleep(next_minute_seconds)
+
+    def _update_display(self):
+        t = rtc.datetime
+        hour = (t.tm_hour+1)%24
+        self.l.text = f"{hour:0>2}\n{t.tm_min:0>2}"
+
+
 clock = Clock()
 
 """ KEYPAD """
@@ -78,10 +102,13 @@ class Voicemeeter():
     VOLUME_DOWN = (K.ALT, K.F8)
     def __init__(self, hid_device):
         self._hid_device = hid_device
+        self._muted = None
         self.mute()
+
     @property
     def unmuted(self):
         return not self._muted
+
     @property
     def muted(self):
         return self._muted
@@ -93,6 +120,7 @@ class Voicemeeter():
         else:
             self._hid_device.send(*self.UNMUTE)
             self._muted = False
+
     def mute(self):
         self.muted = True
     def unmute(self):
@@ -112,15 +140,25 @@ class Voicemeeter():
 
 class MacroKeys():
     """
-    The heavy lifter. It takes input (via key presses and Voicemeeter.muted
-    state) and turns it into HID commands and neopixel colors.
+    The heavy lifter. It takes input (via keys and encoder objects) and turns it
+    into HID commands and neopixel colors.
     """
-    # configure how often to update pixel colors
-    FRAME_LENGTH = 0.1
-    # Configure state and ripple colors: a longer gradient will result in a
-    # "slower" animation. The length of both gradients should be the same, or
-    # you might have issues when jumping from the longer one to the shorter one.
-    # I haven't tested it, but it SHOULD be okay.
+    # Configure timing:
+    # Update rainbow scroll
+    PASSIVE_FRAME_PERIOD = 100
+    # In sync mode, update button ripples every x frames
+    ACTIVE_FRAME_RATIO_SYNC = 2
+    # In sync mode, update button ripples
+    ACTIVE_FRAME_PERIOD = 100
+    # Check button presses (ms)
+    BUTTON_PERIOD = 100
+    # Check encoder position (ms)
+    ENCODER_PERIOD = 500
+    
+    # Configure colors:
+    # Longer gradients will result in a "slower" animation. The length of both
+    # gradients don't have to be the same, but there'll be more of a jump when
+    # moving from one to the other.
     MUTED_GRADIENT = expand_gradient(
         (
             (.60, CRGB( 237,  42,   7 )),
@@ -137,7 +175,13 @@ class MacroKeys():
             (1.0, CRGB(   0, 212, 123 ))
         ), 50
     )
+    # Static riple color. A dynamic color is also available, see
+    # _do_active_passive_frame_sync.
     RIPPLE_COLOR = CRGB(  82, 150,  14 )
+    
+    """
+    SETUP AND LOOPS
+    """
     def __init__(self, keys, hid_device, pixel_buf, pixel_order):
         # deal with arguments
         self._keys = keys
@@ -149,70 +193,109 @@ class MacroKeys():
         self._last_frame_time = monotonic()
         self._ani_offset = 0
         self.pressed_keys = set()
-        self.key_history = [frozenset()]*5
+        self.gesture_history = [frozenset()]*5
         self._timed_key_history = [[]]*5
         self._encoder_pos = encoder.position
-    def tick(self):
+    def tick_sync(self):
         """
         Call this method repeatedly to drive button reactions and to animate LEDs.
         """
-        self._handle_button_events()
-        # self._set_brightness()
-        self._set_volume()
-        self._do_animate()
-    def _set_volume(self):
+        self._handle_button_events_sync()
+        # self._set_brightness_sync()
+        self._set_volume_sync()
+        self._do_active_passive_frame_sync()
+    def get_coroutines(self):
+        return (
+            self._handle_button_events(),
+            self._set_volume(),
+            self._do_passive_frame(),
+            self._do_active_frame()
+        )
+
+    """
+    ENCODER
+    """
+    def _set_volume_sync(self):
         if not self._encoder_pos == encoder.position:
             delta = self._encoder_pos - encoder.position
             self._encoder_pos = encoder.position
             self._vm.change_volume(delta)
-    def _set_brightness(self):
+    async def _set_volume(self):
+        while True:
+            if not self._encoder_pos == encoder.position:
+                delta = self._encoder_pos - encoder.position
+                self._encoder_pos = encoder.position
+                self._vm.change_volume(delta)
+            await asyncio.sleep_ms(self.ENCODER_PERIOD)
+    def _set_brightness_sync(self):
         if not self._encoder_pos == encoder.position:
             delta = self._encoder_pos - encoder.position
             self._encoder_pos = encoder.position
             self._pixels.brightness += delta*0.01
-    def _do_animate(self):
+
+    """
+    NEOPIXEL ANIMATION
+    """
+    async def _do_passive_frame(self):
+        while True:
+            palete_length = self._animate_frame()
+            self._ani_offset = (self._ani_offset + 1) % palete_length
+            await asyncio.sleep_ms(self.PASSIVE_FRAME_PERIOD)
+    async def _do_active_frame(self):
+        while True:
+            self._advance_timed_key_history()
+            await asyncio.sleep_ms(self.ACTIVE_FRAME_PERIOD)
+    def _do_active_passive_frame_sync(self):
         """
         Runs on an interval to update pixels. Take note! This is slower than
-        _handle_button_events. It keeps track of its own color cycle progress
+        _handle_button_events_sync. It keeps track of its own color cycle progress
         (the _ani_offset variable), and also advances the _timed_key_history
         queue (used by _get_press_ripple_frame).
         """
-        next_frame_time = self._last_frame_time + self.FRAME_LENGTH
+        next_frame_time = self._last_frame_time + self.PASSIVE_FRAME_PERIOD/1000
         if next_frame_time > monotonic():
             # it's not time to perform an animation
             return
-        # reset frame timer
+        # reset frame timer and run the next frame
         self._last_frame_time = monotonic()
-        # Get base colors. If you want a ripple color that isn't static, use
-        # _get_color_pressed instead.
+        palete_length = self._animate_frame()
+        
+        # advance passive animation
+        self._ani_offset += 1
+        self._ani_offset %= palete_length
+        
+        # advance button ripple
+        if self._ani_offset % self.ACTIVE_FRAME_RATIO_SYNC:
+            self._advance_timed_key_history()
+
+    def _advance_timed_key_history(self):
+        self._timed_key_history.pop()
+        self._timed_key_history.insert(0,[])
+
+    def _animate_frame(self):
+        # Get base colors.
         if self._vm.unmuted:
             base_palete = self.UNMUTED_GRADIENT
-            # ripple_palete = self.UNMUTED_GRADIENT
         else:
             base_palete = self.MUTED_GRADIENT
-            # ripple_palete = self.MUTED_GRADIENT
         base_colors = self._get_color_base(base_palete)
-        ripple_color = self.RIPPLE_COLOR
+        
+        # Draw the ripple. You could also animate the ripple color:
         # ripple_color = self._get_color_pressed(pressed_palete)
-        # Draw the ripple. You could also only set the pressed button color and
-        # get rid of the ripple effect.
+        ripple_color = self.RIPPLE_COLOR
         for idx, color_emphasis in enumerate(self._get_press_ripple_frame()):
             if color_emphasis:
                 base_colors[idx] = ripple_color
+        
         # Update neopixels. We have to use _pixel_order since the Macropad is
         # rotated.
         for color_idx, pixel_idx in enumerate(self._pixel_order):
             self._pixels[pixel_idx] = denormalize(base_colors[color_idx])
-        # advance animation timing
-        self._ani_offset += 1
-        self._ani_offset %= len(base_palete)
-        # advance button history
-        if self._ani_offset %2:
-            # only updating every other frame gives us a slower animation
-            self._timed_key_history.pop()
-            self._timed_key_history.insert(0,[])
+        
+        # Return the length of the selected base_palete for timing purposes
+        return len(base_palete)
     
-    """ COLORS """
+    # COLORS
     def _get_color_base(self, palete):
         """
         Loops through a palete. When _ani_offset is within 12 positions of the
@@ -234,16 +317,13 @@ class MacroKeys():
         return base_colors
     def _get_color_pressed(self, palete):
         """
-        Currently unused. Un-comment code in _do_animate if you want the ripple
+        Currently unused. Un-comment code in _do_active_passive_frame_sync if you want the ripple
         color to cycle, instead of being satic.
         """
         # grab a single color from the palete
         base_color = palete[self._ani_offset]
         # make it a bit brighter
-        return [
-            v+0.2
-            for v in base_color
-        ]
+        return [v+0.2 for v in base_color]
     def _get_press_ripple_frame(self):
         """
         Uses masks to determine color alterations for rippling button press
@@ -301,7 +381,7 @@ class MacroKeys():
         """
         # Go through each history state and create a mask for the keys pressed
         # at that state. Ripples created farther back in history have bigger
-        # circles now.
+        # circles than newer ones.
         masks = []
         for button in self._timed_key_history[0]:
             # most recent history state
@@ -376,7 +456,7 @@ class MacroKeys():
             ]
             masks.append(trimmed)
         # Sum each pixel position. Ripple intersections could be made brighter
-        # in _do_animate because we're handing back sums instead of just
+        # in _do_active_passive_frame_sync because we're handing back sums instead of just
         # true/false values.
         summed_mask = []
         for row in zip(*masks):
@@ -391,8 +471,11 @@ class MacroKeys():
         return summed_mask[0] + summed_mask[1] + summed_mask[2]
 
 
-    """ BUTTONS AND HISTORY """
-    def _handle_button_events(self):
+    """
+    MACRO BUTTONS AND GESTURES
+    """
+    # BUTTONS
+    def _handle_button_events_sync(self):
         """
         Sends vm toggle commands on button presses and releases unless a rocker gesture was
         performed.
@@ -404,6 +487,21 @@ class MacroKeys():
             return
         elif self._recognize_toggle():
             self._vm.toggle()
+    async def _handle_button_events(self):
+        """
+        Sends vm toggle commands on button presses and releases unless a rocker gesture was
+        performed.
+        """
+        while True:
+            event = self._update_event_history()
+            if event:
+                if self._recognize_rocker():
+                    return
+                elif self._recognize_toggle():
+                    self._vm.toggle()
+            await asyncio.sleep_ms(self.BUTTON_PERIOD)
+
+    # HISTORY
     def _update_event_history(self):
         """
         Runs as often as possible to react to key events. We store information
@@ -414,14 +512,14 @@ class MacroKeys():
         Because this is a set (and not a list), it will only store unique
         values. That shouldn't be important because keypad.Keys uses an event
         queue, but I always treat state trackers with distrust.
-        -- key_history: this is how we remember what previous pressed_keys sets
+        -- gesture_history: this is how we remember what previous pressed_keys sets
         looked like. We only need to remember a history long enough to look for
         gestures. pop() and insert(0,) let this list act like a queue. We add to
         the front and remove from the back, so that the first items are more
         recent than the last ones.
-        -- _timed_key_history: this is just like key_history, but we don't
+        -- _timed_key_history: this is just like gesture_history, but we don't
         pop and insert items. Instead, we add key presses to the first history
-        list, and let _do_animate remove history states once per animation
+        list, and let _do_active_passive_frame_sync remove history states once per animation
         cycle. If more than one key is pressed in a single animation cycle, the
         key numbers will "pile up" and their ripples will all get animated at
         the same time.
@@ -438,23 +536,23 @@ class MacroKeys():
         else:
             self.pressed_keys.discard(event.key_number)
         # update key history
-        self.key_history.pop()
-        self.key_history.insert(0, frozenset(self.pressed_keys))
+        self.gesture_history.pop()
+        self.gesture_history.insert(0, frozenset(self.pressed_keys))
         return event
     
-    """ GESTURES """
+    # GESTURES
     def _recognize_rocker(self):
         """
         A rocking gesture, where one key is pressed, then a second, then they
         are released in the same order.
 
         This logic is super dense, but it's surprising how much work we can do
-        in so few lines of code. First, we check the length of each key_history
+        in so few lines of code. First, we check the length of each gesture_history
         state. If we don't see the right pattern, we don't need to do any more
         work: it's not a rocking gesture. Maybe it was a single key
         press-release, maybe it was a bunch of keys mashed at once. After that,
         we can check the numbers of each key to confirm that it's a rocker
-        gesture. Because key_history is a list of sets, we can use the < and >
+        gesture. Because gesture_history is a list of sets, we can use the < and >
         operators to check that they are proper subsets and supersets of each
         other. mid_state must contain all of the keys (ie the one key) in both
         new_state and old_state. Because we're using the proper superset/subset
@@ -469,26 +567,26 @@ class MacroKeys():
         information on the display easier? Maybe you could beep when a gesture
         has ended?
         """
-        if not tuple(map(lambda s: len(s), self.key_history)) == (0,1,2,1,0):
+        if not tuple(map(lambda s: len(s), self.gesture_history)) == (0,1,2,1,0):
             return
-        _, new_state, mid_state, old_state, _ = self.key_history
+        _, new_state, mid_state, old_state, _ = self.gesture_history
         if new_state < mid_state > old_state:
             return True
     def _gesture_ended(self):
         # history states only ever change by one key
         return bool(
-            len(self.key_history[0]) == 0
-            and len(self.key_history[1]) == 1
+            len(self.gesture_history[0]) == 0
+            and len(self.gesture_history[1]) == 1
         )
     def _gesture_started(self):
         return bool(
-            len(self.key_history[0]) == 1
-            and len(self.key_history[1]) == 0
+            len(self.gesture_history[0]) == 1
+            and len(self.gesture_history[1]) == 0
         )
     def _recognize_toggle(self):
         # returns true if a solo or multi-button press has begun or ended
         last_two_historical_lengths = tuple(map(
-            lambda s: len(s), self.key_history[0:2]
+            lambda s: len(s), self.gesture_history[0:2]
         ))
         # recognize start of toggle
         if last_two_historical_lengths == (1,0):
@@ -498,8 +596,16 @@ class MacroKeys():
             return True
         # else additional keys were pressed
 
+class FakeKeyboard:
+    def __init__(self):
+        pass
+    def send(self, *_):
+        pass
 
-hid_kbd = Keyboard(usb_hid.devices)
+if REPL_MODE:
+    hid_kbd = FakeKeyboard()
+else:
+    hid_kbd = Keyboard(usb_hid.devices)
 macro_keys = MacroKeys(keys, hid_kbd, pixel_buf, pixels_rotated)
 
 
@@ -509,7 +615,16 @@ macro_keys = MacroKeys(keys, hid_kbd, pixel_buf, pixels_rotated)
 while keys.events.get():
     pass
 
-if __name__ == "__main__":
+
+if __name__ == "__main__" and USE_ASYNC:
+    print("starting in async mode")
+    coro = []
+    coro.extend(macro_keys.get_coroutines())
+    coro.append(clock.tick_async())
+    gathered = asyncio.gather(*coro)
+    asyncio.run(gathered)
+elif __name__ == "__main__":
+    print("starting in sync mode")
     while True:
-        macro_keys.tick()
+        macro_keys.tick_sync()
         clock.tick()
