@@ -1,5 +1,7 @@
 #autocopy
 
+from adafruit_display_text                  import label
+import adafruit_ds3231
 from adafruit_fancyled.adafruit_fancyled    import expand_gradient, CRGB, denormalize
 from adafruit_hid.keyboard                  import Keyboard
 from adafruit_hid.keycode                   import Keycode as K
@@ -8,9 +10,36 @@ from digitalio                              import DigitalInOut, Pull
 import keypad
 import neopixel
 import rotaryio
-from time                                   import monotonic
+from terminalio                             import FONT
+from time                                   import monotonic, struct_time
 import usb_hid
+from math import copysign
 
+
+""" CLOCK """
+rtc = adafruit_ds3231.DS3231(board.I2C())
+print(rtc.datetime)
+
+class Clock():
+    INTERVAL = 30
+    def __init__(self):
+        self.d = board.DISPLAY
+        self.d.rotation = 90
+        
+        self.l = label.Label(FONT, text="20\n15", scale=4)
+        self.l.x = 10
+        self.l.y = 25
+        self.d.show(self.l)
+        
+        self.last_update = monotonic()-self.INTERVAL
+        self.tick()
+
+    def tick(self):
+        if self.last_update+self.INTERVAL < monotonic():
+            t = rtc.datetime
+            hour = (t.tm_hour+1)%24
+            self.l.text = f"{hour:0>2}\n{t.tm_min:0>2}"
+clock = Clock()
 
 """ KEYPAD """
 # key_pins_portrait = (
@@ -30,7 +59,7 @@ keys = keypad.Keys(key_pins_landscape, value_when_pressed=False, pull=True)
 encoder = rotaryio.IncrementalEncoder(board.ROTA, board.ROTB)
 button = DigitalInOut(board.BUTTON)
 button.switch_to_input(pull=Pull.UP)
-pixel_buf = neopixel.NeoPixel(board.NEOPIXEL, 12, brightness=0.2)
+pixel_buf = neopixel.NeoPixel(board.NEOPIXEL, 12, brightness=0.1)
 pixels_rotated = (
     2, 5, 8, 11,
     1, 4, 7, 10,
@@ -43,8 +72,10 @@ class Voicemeeter():
     """
     A small class to handle mute and unmute states.
     """
-    MUTE   = (K.ALT, K.F5) # alt + F5
-    UNMUTE = (K.ALT, K.F6) # alt + F6
+    MUTE        = (K.ALT, K.F5) # alt + F5
+    UNMUTE      = (K.ALT, K.F6) # alt + F6
+    VOLUME_UP   = (K.ALT, K.F7)
+    VOLUME_DOWN = (K.ALT, K.F8)
     def __init__(self, hid_device):
         self._hid_device = hid_device
         self.mute()
@@ -68,6 +99,16 @@ class Voicemeeter():
         self.muted = False
     def toggle(self):
         self.muted = not self.muted
+    def change_volume(self, change):
+        direction = int(copysign(1, change))
+        keycombo = (
+            None,            # 0
+            self.VOLUME_UP,  # 1
+            self.VOLUME_DOWN # -1
+        )[direction]
+        count = abs(change)
+        for _ in range(count):
+            self._hid_device.send(*keycombo)
 
 class MacroKeys():
     """
@@ -110,12 +151,25 @@ class MacroKeys():
         self.pressed_keys = set()
         self.key_history = [frozenset()]*5
         self._timed_key_history = [[]]*5
+        self._encoder_pos = encoder.position
     def tick(self):
         """
         Call this method repeatedly to drive button reactions and to animate LEDs.
         """
         self._handle_button_events()
+        # self._set_brightness()
+        self._set_volume()
         self._do_animate()
+    def _set_volume(self):
+        if not self._encoder_pos == encoder.position:
+            delta = self._encoder_pos - encoder.position
+            self._encoder_pos = encoder.position
+            self._vm.change_volume(delta)
+    def _set_brightness(self):
+        if not self._encoder_pos == encoder.position:
+            delta = self._encoder_pos - encoder.position
+            self._encoder_pos = encoder.position
+            self._pixels.brightness += delta*0.01
     def _do_animate(self):
         """
         Runs on an interval to update pixels. Take note! This is slower than
@@ -455,6 +509,7 @@ macro_keys = MacroKeys(keys, hid_kbd, pixel_buf, pixels_rotated)
 while keys.events.get():
     pass
 
-ani_offset = 0
-while True:
-    macro_keys.tick()
+if __name__ == "__main__":
+    while True:
+        macro_keys.tick()
+        clock.tick()
