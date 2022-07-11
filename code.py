@@ -1,4 +1,4 @@
-#autocopy
+# autocopy
 
 # Run synchronous or asynchronous
 USE_ASYNC = True
@@ -9,97 +9,224 @@ if USE_ASYNC:
     import asyncio
 
 import board
-from digitalio                              import DigitalInOut, Pull
-from adafruit_display_text                  import label
+from digitalio import DigitalInOut, Pull
+from displayio import Group
+from adafruit_display_text import label
 import adafruit_ds3231
-from adafruit_fancyled.adafruit_fancyled    import expand_gradient, CRGB, denormalize
-from adafruit_hid.keyboard                  import Keyboard
-from adafruit_hid.keycode                   import Keycode as K
+from adafruit_fancyled.adafruit_fancyled import expand_gradient, CRGB, denormalize
+
+# from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.consumer_control import ConsumerControl
+from adafruit_hid.keycode import Keycode as K
 import keypad
-from math                                   import copysign
+from math import copysign
+import microcontroller
 import neopixel
+from adafruit_simple_text_display import SimpleTextDisplay as SimTex
 import rotaryio
-from terminalio                             import FONT
-from time                                   import monotonic
+from terminalio import FONT
+from time import monotonic
 import usb_hid
 
 
+"""
+NVM MANAGEMENT
+"""
 
 
-""" CLOCK """
+def fetch_nvm_sel_hour():
+    # NVM byte 0
+    mem_sel_hour = microcontroller.nvm[0]
+    # decode selected
+    mem_selected = mem_sel_hour & 0b000_000_11
+    # decode hour
+    mem_hour = (mem_sel_hour & 0b000_111_00) >> 2
+    mem_hour -= 4
+
+    return mem_selected, mem_hour
+
+
+def fetch_nvm_brightness():
+    # NVM byte 1
+    mem_bright = microcontroller.nvm[1]
+    brightness = mem_bright / 255
+    return brightness
+
+
+def set_nvm_selected(value):
+    mem_sel_hour = microcontroller.nvm[0]
+    mem_sel_hour &= 0b111_111_00
+    mem_sel_hour |= value << 0
+    microcontroller.nvm[0] = mem_sel_hour
+
+
+def set_nvm_hour(value):
+    value += 4
+    value = max(0, min(value, 7))
+    mem_sel_hour = microcontroller.nvm[0]
+    mem_sel_hour &= 0b111_000_11
+    mem_sel_hour |= value << 2
+    microcontroller.nvm[0] = mem_sel_hour
+
+
+def set_nvm_brightness(value):
+    mem_bright = int(value * 255)
+    microcontroller.nvm[1] = mem_bright
+
+
+"""
+CLOCK
+"""
 rtc = adafruit_ds3231.DS3231(board.I2C())
 print(rtc.datetime)
 
-class Clock():
+
+class GraphicalUserInterface:
     INTERVAL = 30
+    WHITE = (255, 255, 255)
+    BLACK = (0, 0, 0)
+
     def __init__(self):
+        # fetch values from NVM
+        mem_selected, mem_hour = fetch_nvm_sel_hour()
+        self._selected = mem_selected % 3
+        self._hour_offset = mem_hour
+
+        # display init
         self.d = board.DISPLAY
         self.d.rotation = 90
-        
+
+        # sync mode setup
+        self.last_update = monotonic() - self.INTERVAL
+
+        # create clock label
         self.l = label.Label(FONT, text="20\n15", scale=4)
         self.l.x = 10
         self.l.y = 25
-        self.d.show(self.l)
-        
-        self.last_update = monotonic()-self.INTERVAL
-        self.tick()
+        # update and show
+        self.tick_sync()
+        self.show_clock()
 
-    def tick(self):
-        if self.last_update+self.INTERVAL < monotonic():
-            self._update_display()
-    async def tick_async(self):
+        # menu
+        self.m = None
+
+    # NVM-stored properties
+    @property
+    def selected(self):
+        return self._selected
+
+    @selected.setter
+    def selected(self, value):
+        value %= 3
+        self._selected = value
+        self._update_selection()
+        set_nvm_selected(value)
+
+    @property
+    def hour_offset(self):
+        return self._hour_offset
+
+    @hour_offset.setter
+    def hour_offset(self, value):
+        value = min(4, max(value, -4))
+        self._hour_offset = value
+        self._update_clock_label()
+        set_nvm_hour(value)
+
+    # SCHEDULED TASKS
+    def tick_sync(self):
+        if self.last_update + self.INTERVAL < monotonic():
+            self._update_clock_label()
+            self.last_update = monotonic()
+
+    async def tick(self):
         while True:
             # Do first update right away
-            self._update_display()
-            
+            self._update_clock_label()
+
             # Do subsequent updates at the top of the minute
             next_minute_seconds = 60 - rtc.datetime.tm_sec
-            print(f"next_minute_seconds: {next_minute_seconds}")
             await asyncio.sleep(next_minute_seconds)
 
-    def _update_display(self):
+    # CLOCK
+    def show_clock(self):
+        self.d.show(self.l)
+
+    def _update_clock_label(self):
         t = rtc.datetime
-        hour = (t.tm_hour+1)%24
+        hour = (t.tm_hour + self.hour_offset) % 24
         self.l.text = f"{hour:0>2}\n{t.tm_min:0>2}"
 
+    # MENU
+    def show_menu(self):
+        self._update_selection()
+        self.m.show()
 
-clock = Clock()
+    def showing_menu(self):
+        return bool(self.m and self.d.root_group[0] == self.m[0])
 
-""" KEYPAD """
-# key_pins_portrait = (
-#             board.KEY1,  board.KEY2,  board.KEY3,
-#             board.KEY4,  board.KEY5,  board.KEY6,
-#             board.KEY7,  board.KEY8,  board.KEY9,
-#             board.KEY10, board.KEY11, board.KEY12)
-key_pins_landscape = (
-            board.KEY3, board.KEY6, board.KEY9, board.KEY12,
-            board.KEY2, board.KEY5, board.KEY8, board.KEY11,
-            board.KEY1, board.KEY4, board.KEY7, board.KEY10
-)
-keys = keypad.Keys(key_pins_landscape, value_when_pressed=False, pull=True)
+    def _build_menu(self):
+        self.m = SimTex(colors=[self.WHITE])
+        self.m[0].text = "  ENCODER  "
+        self.m[1].text = "  FUNCTION "
+        self.m[2].text = "~~~~~~~~~~~"
+        self.m[3].text = "Brightness "
+        self.m[4].text = "Volume     "
+        self.m[5].text = "Hour offset"
+
+    def _update_selection(self):
+        if not self.m:
+            self._build_menu()
+
+        # Clear selection
+        for label in self.m._lines:
+            label.color = self.WHITE
+            label.background_color = self.BLACK
+
+        # Set new selection
+        idx = self.selected + 3
+        self.m[idx].color = self.BLACK
+        self.m[idx].background_color = self.WHITE
 
 
-""" OTHER IO """
-encoder = rotaryio.IncrementalEncoder(board.ROTA, board.ROTB)
-button = DigitalInOut(board.BUTTON)
-button.switch_to_input(pull=Pull.UP)
-pixel_buf = neopixel.NeoPixel(board.NEOPIXEL, 12, brightness=0.1)
-pixels_rotated = (
-    2, 5, 8, 11,
-    1, 4, 7, 10,
-    0, 3, 6, 9
-)
+gui = GraphicalUserInterface()
 
 
-""" HID """
-class Voicemeeter():
+"""
+HID
+"""
+
+#
+# Setup
+#
+class FakeKeyboard:
+    def __init__(self):
+        pass
+
+    def send(self, *args):
+        print(args)
+
+
+if REPL_MODE:
+    print("REPL MODE!")
+    hid_keyboard = FakeKeyboard()
+else:
+    print("HID MODE!")
+    hid_keyboard = ConsumerControl(usb_hid.devices)  # Keyboard(usb_hid.devices)
+
+#
+# Logic
+#
+class Voicemeeter:
     """
     A small class to handle mute and unmute states.
     """
-    MUTE        = (K.ALT, K.F5) # alt + F5
-    UNMUTE      = (K.ALT, K.F6) # alt + F6
-    VOLUME_UP   = (K.ALT, K.F7)
-    VOLUME_DOWN = (K.ALT, K.F8)
+
+    MUTE = 200  # (K.ALT, K.KEYPAD_ZERO)
+    UNMUTE = 201  # (K.ALT, K.KEYPAD_ONE)
+    VOLUME_UP = 202  # (K.ALT, K.KEYPAD_TWO)
+    VOLUME_DOWN = 203  # (K.ALT, K.KEYPAD_THREE)
+
     def __init__(self, hid_device):
         self._hid_device = hid_device
         self._muted = None
@@ -112,37 +239,133 @@ class Voicemeeter():
     @property
     def muted(self):
         return self._muted
+
     @muted.setter
     def muted(self, value):
         if value:
-            self._hid_device.send(*self.MUTE)
+            self._hid_device.send(self.MUTE)
             self._muted = True
         else:
-            self._hid_device.send(*self.UNMUTE)
+            self._hid_device.send(self.UNMUTE)
             self._muted = False
 
     def mute(self):
         self.muted = True
+
     def unmute(self):
         self.muted = False
+
     def toggle(self):
         self.muted = not self.muted
+
     def change_volume(self, change):
         direction = int(copysign(1, change))
-        keycombo = (
-            None,            # 0
-            self.VOLUME_UP,  # 1
-            self.VOLUME_DOWN # -1
-        )[direction]
+        #              0               1                -1
+        keycombo = (None, self.VOLUME_UP, self.VOLUME_DOWN)[direction]
         count = abs(change)
         for _ in range(count):
-            self._hid_device.send(*keycombo)
+            self._hid_device.send(keycombo)
 
-class MacroKeys():
+
+voicemeeter = Voicemeeter(hid_keyboard)
+
+"""
+MACROPAD HARDWARE
+"""
+
+#
+# ENCODER
+#
+encoder = rotaryio.IncrementalEncoder(board.ROTA, board.ROTB)
+encoder_button = keypad.Keys([board.BUTTON], value_when_pressed=False, pull=True)
+
+
+class MacroEncoder:
+    # Check encoder presses (ms)
+    BUTTON_PERIOD = 100
+    # Check encoder position (ms)
+    ENCODER_PERIOD = 500
+
+    def __init__(self):
+        self._encoder_pos = encoder.position
+        self._modes = (
+            self._set_brightness,
+            self._set_volume,
+            self._set_hour,
+        )
+
+    async def tick(self):
+        while True:
+            # Check encoder position
+            if not self._encoder_pos == encoder.position:
+                # get delta, reset saved position
+                delta = self._encoder_pos - encoder.position
+                self._encoder_pos = encoder.position
+
+                # find current mode, run its function
+                if gui.showing_menu():
+                    self._set_menu_selection(delta)
+                else:
+                    mode_function = self._modes[gui.selected]
+                    mode_function(delta)
+
+            # Check encoder button
+            event = encoder_button.events.get()
+            if event and event.pressed:
+                self._toggle_menu()
+
+            # Next loop
+            await asyncio.sleep_ms(self.ENCODER_PERIOD)
+
+    def _set_brightness(self, delta):
+        pixel_buf.brightness += delta * 0.01
+        set_nvm_brightness(pixel_buf.brightness)
+
+    def _set_volume(self, delta):
+        voicemeeter.change_volume(delta)
+
+    def _set_hour(self, delta):
+        gui.hour_offset += delta
+
+    def _set_menu_selection(self, delta):
+        gui.selected -= delta
+
+    def _toggle_menu(self):
+        if gui.showing_menu():
+            gui.show_clock()
+        else:
+            gui.show_menu()
+
+
+macro_encoder = MacroEncoder()
+
+#
+# KEYS
+#
+pixel_buf = neopixel.NeoPixel(board.NEOPIXEL, 12, brightness=fetch_nvm_brightness())
+pixel_order = (2, 5, 8, 11, 1, 4, 7, 10, 0, 3, 6, 9)
+
+# fmt: off
+# key_pins_portrait = (
+#             board.KEY1,  board.KEY2,  board.KEY3,
+#             board.KEY4,  board.KEY5,  board.KEY6,
+#             board.KEY7,  board.KEY8,  board.KEY9,
+#             board.KEY10, board.KEY11, board.KEY12)
+key_pins_landscape = (
+    board.KEY3, board.KEY6, board.KEY9, board.KEY12,
+    board.KEY2, board.KEY5, board.KEY8, board.KEY11,
+    board.KEY1, board.KEY4, board.KEY7, board.KEY10,
+)
+# fmt: on
+keys = keypad.Keys(key_pins_landscape, value_when_pressed=False, pull=True)
+
+
+class MacroKeys:
     """
     The heavy lifter. It takes input (via keys and encoder objects) and turns it
     into HID commands and neopixel colors.
     """
+
     # Configure timing:
     # Update rainbow scroll
     PASSIVE_FRAME_PERIOD = 100
@@ -154,48 +377,45 @@ class MacroKeys():
     BUTTON_PERIOD = 100
     # Check encoder position (ms)
     ENCODER_PERIOD = 500
-    
+
     # Configure colors:
     # Longer gradients will result in a "slower" animation. The length of both
     # gradients don't have to be the same, but there'll be more of a jump when
     # moving from one to the other.
     MUTED_GRADIENT = expand_gradient(
         (
-            (.60, CRGB( 237,  42,   7 )),
-            (.80, CRGB( 255,  61,  94 )),
-            (.90, CRGB( 199, 152,  22 )),
-            (1.0, CRGB( 237,  42,   7 ))
-        ), 50
+            (0.60, CRGB(237, 42, 7)),
+            (0.80, CRGB(255, 61, 94)),
+            (0.90, CRGB(199, 152, 22)),
+            (1.0, CRGB(237, 42, 7)),
+        ),
+        50,
     )
     UNMUTED_GRADIENT = expand_gradient(
         (
-            (.60, CRGB(   0, 212, 123 )),
-            (.80, CRGB(  64, 230,  81 )),
-            (.90, CRGB(  31, 240, 222 )),
-            (1.0, CRGB(   0, 212, 123 ))
-        ), 50
+            (0.60, CRGB(0, 212, 123)),
+            (0.80, CRGB(64, 230, 81)),
+            (0.90, CRGB(31, 240, 222)),
+            (1.0, CRGB(0, 212, 123)),
+        ),
+        50,
     )
     # Static riple color. A dynamic color is also available, see
     # _do_active_passive_frame_sync.
-    RIPPLE_COLOR = CRGB(  82, 150,  14 )
-    
+    RIPPLE_COLOR = CRGB(82, 150, 14)
+
     """
     SETUP AND LOOPS
     """
-    def __init__(self, keys, hid_device, pixel_buf, pixel_order):
-        # deal with arguments
-        self._keys = keys
-        self._vm = Voicemeeter(hid_device)
-        self._pixels = pixel_buf
-        self._pixel_order = pixel_order
 
+    def __init__(self):
         # variable initial states
         self._last_frame_time = monotonic()
         self._ani_offset = 0
         self.pressed_keys = set()
-        self.gesture_history = [frozenset()]*5
-        self._timed_key_history = [[]]*5
-        self._encoder_pos = encoder.position
+        self.gesture_history = [frozenset()] * 5
+        self._timed_key_history = [[]] * 5
+
     def tick_sync(self):
         """
         Call this method repeatedly to drive button reactions and to animate LEDs.
@@ -204,47 +424,29 @@ class MacroKeys():
         # self._set_brightness_sync()
         self._set_volume_sync()
         self._do_active_passive_frame_sync()
+
     def get_coroutines(self):
         return (
             self._handle_button_events(),
-            self._set_volume(),
             self._do_passive_frame(),
-            self._do_active_frame()
+            self._do_active_frame(),
         )
-
-    """
-    ENCODER
-    """
-    def _set_volume_sync(self):
-        if not self._encoder_pos == encoder.position:
-            delta = self._encoder_pos - encoder.position
-            self._encoder_pos = encoder.position
-            self._vm.change_volume(delta)
-    async def _set_volume(self):
-        while True:
-            if not self._encoder_pos == encoder.position:
-                delta = self._encoder_pos - encoder.position
-                self._encoder_pos = encoder.position
-                self._vm.change_volume(delta)
-            await asyncio.sleep_ms(self.ENCODER_PERIOD)
-    def _set_brightness_sync(self):
-        if not self._encoder_pos == encoder.position:
-            delta = self._encoder_pos - encoder.position
-            self._encoder_pos = encoder.position
-            self._pixels.brightness += delta*0.01
 
     """
     NEOPIXEL ANIMATION
     """
+
     async def _do_passive_frame(self):
         while True:
             palete_length = self._animate_frame()
             self._ani_offset = (self._ani_offset + 1) % palete_length
             await asyncio.sleep_ms(self.PASSIVE_FRAME_PERIOD)
+
     async def _do_active_frame(self):
         while True:
             self._advance_timed_key_history()
             await asyncio.sleep_ms(self.ACTIVE_FRAME_PERIOD)
+
     def _do_active_passive_frame_sync(self):
         """
         Runs on an interval to update pixels. Take note! This is slower than
@@ -252,49 +454,49 @@ class MacroKeys():
         (the _ani_offset variable), and also advances the _timed_key_history
         queue (used by _get_press_ripple_frame).
         """
-        next_frame_time = self._last_frame_time + self.PASSIVE_FRAME_PERIOD/1000
+        next_frame_time = self._last_frame_time + self.PASSIVE_FRAME_PERIOD / 1000
         if next_frame_time > monotonic():
             # it's not time to perform an animation
             return
         # reset frame timer and run the next frame
         self._last_frame_time = monotonic()
         palete_length = self._animate_frame()
-        
+
         # advance passive animation
         self._ani_offset += 1
         self._ani_offset %= palete_length
-        
+
         # advance button ripple
         if self._ani_offset % self.ACTIVE_FRAME_RATIO_SYNC:
             self._advance_timed_key_history()
 
     def _advance_timed_key_history(self):
         self._timed_key_history.pop()
-        self._timed_key_history.insert(0,[])
+        self._timed_key_history.insert(0, [])
 
     def _animate_frame(self):
         # Get base colors.
-        if self._vm.unmuted:
+        if voicemeeter.unmuted:
             base_palete = self.UNMUTED_GRADIENT
         else:
             base_palete = self.MUTED_GRADIENT
         base_colors = self._get_color_base(base_palete)
-        
+
         # Draw the ripple. You could also animate the ripple color:
         # ripple_color = self._get_color_pressed(pressed_palete)
         ripple_color = self.RIPPLE_COLOR
         for idx, color_emphasis in enumerate(self._get_press_ripple_frame()):
             if color_emphasis:
                 base_colors[idx] = ripple_color
-        
+
         # Update neopixels. We have to use _pixel_order since the Macropad is
         # rotated.
-        for color_idx, pixel_idx in enumerate(self._pixel_order):
-            self._pixels[pixel_idx] = denormalize(base_colors[color_idx])
-        
+        for color_idx, pixel_idx in enumerate(pixel_order):
+            pixel_buf[pixel_idx] = denormalize(base_colors[color_idx])
+
         # Return the length of the selected base_palete for timing purposes
         return len(base_palete)
-    
+
     # COLORS
     def _get_color_base(self, palete):
         """
@@ -307,14 +509,15 @@ class MacroKeys():
         # Find the start and end positions for this animation offset. Divmod is
         # handy here, because it'll tell us if we went off the end of the
         # palete.
-        start     = self._ani_offset % len(palete)
-        wrap, end = divmod(self._ani_offset+12, len(palete))
+        start = self._ani_offset % len(palete)
+        wrap, end = divmod(self._ani_offset + 12, len(palete))
         # get colors
         if wrap:
             base_colors = palete[start:] + palete[:end]
         else:
             base_colors = palete[start:end]
         return base_colors
+
     def _get_color_pressed(self, palete):
         """
         Currently unused. Un-comment code in _do_active_passive_frame_sync if you want the ripple
@@ -323,7 +526,8 @@ class MacroKeys():
         # grab a single color from the palete
         base_color = palete[self._ani_offset]
         # make it a bit brighter
-        return [v+0.2 for v in base_color]
+        return [v + 0.2 for v in base_color]
+
     def _get_press_ripple_frame(self):
         """
         Uses masks to determine color alterations for rippling button press
@@ -332,7 +536,7 @@ class MacroKeys():
         sprites! You could add additional animation frames (if you also add more
         empty history frames to _timed_key_history in __init__), and create
         fancier ripple patterns. Maybe they should sparkle?
-        
+
         Each mask is oversized, allowing for margins around the 4x3
         grid of buttons. If we were to drop the leftmost columns and bottommost
         rows, the center of this mask would be placed in the bottom left corner.
@@ -357,12 +561,12 @@ class MacroKeys():
         divmod(4) = 1,0  =>  drop_from_top:1, bottom:1, right:0, left:3
 
         This could be calculated as:
-        
+
         drop_from_top    = 2 - y
         drop_from_bottom = 2 - drop_from_top
         drop_from_left   = 3 - x
         drop_from_right  = 3 - drop_from_left
-        
+
         ... but it's more useful to use slices instead so we can grab the rows
         and columns we want in a single step:
 
@@ -385,75 +589,67 @@ class MacroKeys():
         masks = []
         for button in self._timed_key_history[0]:
             # most recent history state
-            mask = [[0,0,0,0,0,0,0],
-                    [0,0,0,1,0,0,0],
-                    [0,0,1,0,1,0,0],
-                    [0,0,0,1,0,0,0],
-                    [0,0,0,0,0,0,0]]
-            y, x = divmod(button,4)
-            col_start = 2 - y
-            col_end   = 5 - y
-            row_start = 3 - x
-            row_end   = 7 - x
-            trimmed = [
-                row[row_start:row_end]
-                for row
-                in mask[col_start:col_end]
+            mask = [
+                [0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0],
+                [0, 0, 1, 0, 1, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
             ]
+            y, x = divmod(button, 4)
+            col_start = 2 - y
+            col_end = 5 - y
+            row_start = 3 - x
+            row_end = 7 - x
+            trimmed = [row[row_start:row_end] for row in mask[col_start:col_end]]
             masks.append(trimmed)
         for button in self._timed_key_history[1]:
             # second history state
-            mask = [[0,0,0,1,0,0,0],
-                    [0,0,1,0,1,0,0],
-                    [0,1,0,0,0,1,0],
-                    [0,0,1,0,1,0,0],
-                    [0,0,0,1,0,0,0]]
-            y, x = divmod(button,4)
-            col_start = 2 - y
-            col_end   = 5 - y
-            row_start = 3 - x
-            row_end   = 7 - x
-            trimmed = [
-                row[row_start:row_end]
-                for row
-                in mask[col_start:col_end]
+            mask = [
+                [0, 0, 0, 1, 0, 0, 0],
+                [0, 0, 1, 0, 1, 0, 0],
+                [0, 1, 0, 0, 0, 1, 0],
+                [0, 0, 1, 0, 1, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0],
             ]
+            y, x = divmod(button, 4)
+            col_start = 2 - y
+            col_end = 5 - y
+            row_start = 3 - x
+            row_end = 7 - x
+            trimmed = [row[row_start:row_end] for row in mask[col_start:col_end]]
             masks.append(trimmed)
         for button in self._timed_key_history[2]:
             # third history state
-            mask = [[0,0,1,0,1,0,0],
-                    [0,1,0,0,0,1,0],
-                    [1,0,0,0,0,0,1],
-                    [0,1,0,0,0,1,0],
-                    [0,0,1,0,1,0,0]]
-            y, x = divmod(button,4)
-            col_start = 2 - y
-            col_end   = 5 - y
-            row_start = 3 - x
-            row_end   = 7 - x
-            trimmed = [
-                row[row_start:row_end]
-                for row
-                in mask[col_start:col_end]
+            mask = [
+                [0, 0, 1, 0, 1, 0, 0],
+                [0, 1, 0, 0, 0, 1, 0],
+                [1, 0, 0, 0, 0, 0, 1],
+                [0, 1, 0, 0, 0, 1, 0],
+                [0, 0, 1, 0, 1, 0, 0],
             ]
+            y, x = divmod(button, 4)
+            col_start = 2 - y
+            col_end = 5 - y
+            row_start = 3 - x
+            row_end = 7 - x
+            trimmed = [row[row_start:row_end] for row in mask[col_start:col_end]]
             masks.append(trimmed)
         for button in self._timed_key_history[3]:
             # fourth history state
-            mask = [[0,1,0,0,0,1,0],
-                    [1,0,0,0,0,0,1],
-                    [0,0,0,0,0,0,0],
-                    [1,0,0,0,0,0,1],
-                    [0,1,0,0,0,1,0]]
-            y, x = divmod(button,4)
-            col_start = 2 - y
-            col_end   = 5 - y
-            row_start = 3 - x
-            row_end   = 7 - x
-            trimmed = [
-                row[row_start:row_end]
-                for row
-                in mask[col_start:col_end]
+            mask = [
+                [0, 1, 0, 0, 0, 1, 0],
+                [1, 0, 0, 0, 0, 0, 1],
+                [0, 0, 0, 0, 0, 0, 0],
+                [1, 0, 0, 0, 0, 0, 1],
+                [0, 1, 0, 0, 0, 1, 0],
             ]
+            y, x = divmod(button, 4)
+            col_start = 2 - y
+            col_end = 5 - y
+            row_start = 3 - x
+            row_end = 7 - x
+            trimmed = [row[row_start:row_end] for row in mask[col_start:col_end]]
             masks.append(trimmed)
         # Sum each pixel position. Ripple intersections could be made brighter
         # in _do_active_passive_frame_sync because we're handing back sums instead of just
@@ -462,14 +658,13 @@ class MacroKeys():
         for row in zip(*masks):
             # note that zip(*[]) is the inverse of zip([])
             columns = zip(*row)
-            summed_row = list( map(sum, columns) )
+            summed_row = list(map(sum, columns))
             summed_mask.append(summed_row)
         # return a flat list
         if not summed_mask:
             # if all history states are empty, no masks will have been created
-            return [0]*4*3
+            return [0] * 4 * 3
         return summed_mask[0] + summed_mask[1] + summed_mask[2]
-
 
     """
     MACRO BUTTONS AND GESTURES
@@ -486,7 +681,8 @@ class MacroKeys():
         if self._recognize_rocker():
             return
         elif self._recognize_toggle():
-            self._vm.toggle()
+            voicemeeter.toggle()
+
     async def _handle_button_events(self):
         """
         Sends vm toggle commands on button presses and releases unless a rocker gesture was
@@ -496,9 +692,9 @@ class MacroKeys():
             event = self._update_event_history()
             if event:
                 if self._recognize_rocker():
-                    return
+                    continue
                 elif self._recognize_toggle():
-                    self._vm.toggle()
+                    voicemeeter.toggle()
             await asyncio.sleep_ms(self.BUTTON_PERIOD)
 
     # HISTORY
@@ -506,7 +702,7 @@ class MacroKeys():
         """
         Runs as often as possible to react to key events. We store information
         from events in three places:
-        
+
         -- pressed_keys: this is a set of all currently pressed key numbers. We add to
         the set when new keys are pressed, and remove when they're released.
         Because this is a set (and not a list), it will only store unique
@@ -525,7 +721,7 @@ class MacroKeys():
         the same time.
         """
         # get new event
-        event = self._keys.events.get()
+        event = keys.events.get()
         if not event:
             # nothing to update!
             return
@@ -539,7 +735,7 @@ class MacroKeys():
         self.gesture_history.pop()
         self.gesture_history.insert(0, frozenset(self.pressed_keys))
         return event
-    
+
     # GESTURES
     def _recognize_rocker(self):
         """
@@ -567,50 +763,43 @@ class MacroKeys():
         information on the display easier? Maybe you could beep when a gesture
         has ended?
         """
-        if not tuple(map(lambda s: len(s), self.gesture_history)) == (0,1,2,1,0):
+        if not tuple(map(lambda s: len(s), self.gesture_history)) == (0, 1, 2, 1, 0):
             return
         _, new_state, mid_state, old_state, _ = self.gesture_history
         if new_state < mid_state > old_state:
             return True
+
     def _gesture_ended(self):
         # history states only ever change by one key
         return bool(
-            len(self.gesture_history[0]) == 0
-            and len(self.gesture_history[1]) == 1
+            len(self.gesture_history[0]) == 0 and len(self.gesture_history[1]) == 1
         )
+
     def _gesture_started(self):
         return bool(
-            len(self.gesture_history[0]) == 1
-            and len(self.gesture_history[1]) == 0
+            len(self.gesture_history[0]) == 1 and len(self.gesture_history[1]) == 0
         )
+
     def _recognize_toggle(self):
         # returns true if a solo or multi-button press has begun or ended
-        last_two_historical_lengths = tuple(map(
-            lambda s: len(s), self.gesture_history[0:2]
-        ))
+        last_two_historical_lengths = tuple(
+            map(lambda s: len(s), self.gesture_history[0:2])
+        )
         # recognize start of toggle
-        if last_two_historical_lengths == (1,0):
+        if last_two_historical_lengths == (1, 0):
             return True
         # recognize end of toggle
-        if last_two_historical_lengths == (0,1):
+        if last_two_historical_lengths == (0, 1):
             return True
         # else additional keys were pressed
 
-class FakeKeyboard:
-    def __init__(self):
-        pass
-    def send(self, *_):
-        pass
 
-if REPL_MODE:
-    hid_kbd = FakeKeyboard()
-else:
-    hid_kbd = Keyboard(usb_hid.devices)
-macro_keys = MacroKeys(keys, hid_kbd, pixel_buf, pixels_rotated)
+macro_keys = MacroKeys()
 
 
-
-""" MAIN LOOP """
+"""
+MAIN LOOP
+"""
 # clear event buffer
 while keys.events.get():
     pass
@@ -620,11 +809,12 @@ if __name__ == "__main__" and USE_ASYNC:
     print("starting in async mode")
     coro = []
     coro.extend(macro_keys.get_coroutines())
-    coro.append(clock.tick_async())
+    coro.append(gui.tick())
+    coro.append(macro_encoder.tick())
     gathered = asyncio.gather(*coro)
     asyncio.run(gathered)
 elif __name__ == "__main__":
     print("starting in sync mode")
     while True:
         macro_keys.tick_sync()
-        clock.tick()
+        gui.tick_sync()
